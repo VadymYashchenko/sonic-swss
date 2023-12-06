@@ -50,13 +50,14 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
         string ecn_mode;
         string encap_ecn_mode;
         string ttl_mode;
-        sai_object_id_t dscp_to_dc_map_id = SAI_NULL_OBJECT_ID;
+        sai_object_id_t dscp_to_tc_map_id = SAI_NULL_OBJECT_ID;
         sai_object_id_t tc_to_pg_map_id = SAI_NULL_OBJECT_ID;
         // The tc_to_dscp_map_id and tc_to_queue_map_id are parsed here for muxorch to retrieve
         sai_object_id_t tc_to_dscp_map_id = SAI_NULL_OBJECT_ID;
         sai_object_id_t tc_to_queue_map_id = SAI_NULL_OBJECT_ID;
 
         bool valid = true;
+        task_process_status task_status = task_process_status::task_success;
 
         sai_object_id_t tunnel_id = SAI_NULL_OBJECT_ID;
 
@@ -66,7 +67,7 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
         {
             tunnel_id = tunnelTable[key].tunnel_id;
         }
-        
+
         if (op == SET_COMMAND)
         {
 
@@ -143,7 +144,9 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
                     }
                     if (exists)
                     {
-                        setTunnelAttribute(fvField(i), ecn_mode, tunnel_id);
+                        SWSS_LOG_NOTICE("Skip setting ecn_mode since the SAI attribute SAI_TUNNEL_ATTR_DECAP_ECN_MODE is create only");
+                        valid = false;
+                        break;
                     }
                 }
                 else if (fvField(i) == "encap_ecn_mode")
@@ -157,7 +160,9 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
                     }
                     if (exists)
                     {
-                        setTunnelAttribute(fvField(i), encap_ecn_mode, tunnel_id);
+                        SWSS_LOG_NOTICE("Skip setting encap_ecn_mode since the SAI attribute SAI_TUNNEL_ATTR_ENCAP_ECN_MODE is create only");
+                        valid = false;
+                        break;
                     }
                 }
                 else if (fvField(i) == "ttl_mode")
@@ -176,16 +181,28 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
                 }
                 else if (fvField(i) == decap_dscp_to_tc_field_name)
                 {
-                    dscp_to_dc_map_id = gQosOrch->resolveTunnelQosMap(table_name, key, decap_dscp_to_tc_field_name, t); 
-                    if (exists && dscp_to_dc_map_id != SAI_NULL_OBJECT_ID)
+                    dscp_to_tc_map_id = gQosOrch->resolveTunnelQosMap(table_name, key, decap_dscp_to_tc_field_name, t);
+                    if (dscp_to_tc_map_id == SAI_NULL_OBJECT_ID)
                     {
-                        setTunnelAttribute(fvField(i), dscp_to_dc_map_id, tunnel_id);
+                        SWSS_LOG_NOTICE("QoS map %s is not ready yet", decap_dscp_to_tc_field_name.c_str());
+                        task_status = task_process_status::task_need_retry;
+                        break;
+                    }
+                    if (exists)
+                    {
+                        setTunnelAttribute(fvField(i), dscp_to_tc_map_id, tunnel_id);
                     }
                 }
                 else if (fvField(i) == decap_tc_to_pg_field_name)
                 {
-                    tc_to_pg_map_id = gQosOrch->resolveTunnelQosMap(table_name, key, decap_tc_to_pg_field_name, t); 
-                    if (exists && tc_to_pg_map_id != SAI_NULL_OBJECT_ID)
+                    tc_to_pg_map_id = gQosOrch->resolveTunnelQosMap(table_name, key, decap_tc_to_pg_field_name, t);
+                    if (tc_to_pg_map_id == SAI_NULL_OBJECT_ID)
+                    {
+                        SWSS_LOG_NOTICE("QoS map %s is not ready yet", decap_tc_to_pg_field_name.c_str());
+                        task_status = task_process_status::task_need_retry;
+                        break;
+                    }
+                    if (exists)
                     {
                         setTunnelAttribute(fvField(i), tc_to_pg_map_id, tunnel_id);
                     }
@@ -193,6 +210,12 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
                 else if (fvField(i) == encap_tc_to_dscp_field_name)
                 {
                     tc_to_dscp_map_id = gQosOrch->resolveTunnelQosMap(table_name, key, encap_tc_to_dscp_field_name, t);
+                    if (tc_to_dscp_map_id == SAI_NULL_OBJECT_ID)
+                    {
+                        SWSS_LOG_NOTICE("QoS map %s is not ready yet", encap_tc_to_dscp_field_name.c_str());
+                        task_status = task_process_status::task_need_retry;
+                        break;
+                    }
                     if (exists)
                     {
                         // Record only
@@ -202,6 +225,12 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
                 else if (fvField(i) == encap_tc_to_queue_field_name)
                 {
                     tc_to_queue_map_id = gQosOrch->resolveTunnelQosMap(table_name, key, encap_tc_to_queue_field_name, t);
+                    if (tc_to_queue_map_id == SAI_NULL_OBJECT_ID)
+                    {
+                        SWSS_LOG_NOTICE("QoS map %s is not ready yet", encap_tc_to_queue_field_name.c_str());
+                        task_status = task_process_status::task_need_retry;
+                        break;
+                    }
                     if (exists)
                     {
                         // Record only
@@ -210,12 +239,18 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
                 }
             }
 
+            if (task_status == task_process_status::task_need_retry)
+            {
+                ++it;
+                continue;
+            }
+
             //create new tunnel if it doesn't exists already
             if (valid && !exists)
             {
-                
+
                 if (addDecapTunnel(key, tunnel_type, ip_addresses, p_src_ip, dscp_mode, ecn_mode, encap_ecn_mode, ttl_mode,
-                                    dscp_to_dc_map_id, tc_to_pg_map_id))
+                                    dscp_to_tc_map_id, tc_to_pg_map_id))
                 {
                     // Record only
                     tunnelTable[key].encap_tc_to_dscp_map_id = tc_to_dscp_map_id;
@@ -233,7 +268,7 @@ void TunnelDecapOrch::doTask(Consumer& consumer)
         {
             if (exists)
             {
-                removeDecapTunnel(key);
+                removeDecapTunnel(table_name, key);
             }
             else
             {
@@ -396,7 +431,7 @@ bool TunnelDecapOrch::addDecapTunnel(
         attr.value.oid = tc_to_pg_map_id;
         tunnel_attrs.push_back(attr);
     }
-    
+
     // write attributes to ASIC_DB
     sai_object_id_t tunnel_id;
     status = sai_tunnel_api->create_tunnel(&tunnel_id, gSwitchId, (uint32_t)tunnel_attrs.size(), tunnel_attrs.data());
@@ -551,30 +586,6 @@ bool TunnelDecapOrch::setTunnelAttribute(string field, string value, sai_object_
 
     sai_attribute_t attr;
 
-    if (field == "ecn_mode")
-    {
-        // decap ecn mode (copy from outer/standard)
-        attr.id = SAI_TUNNEL_ATTR_DECAP_ECN_MODE;
-        if (value == "copy_from_outer")
-        {
-            attr.value.s32 = SAI_TUNNEL_DECAP_ECN_MODE_COPY_FROM_OUTER;
-        }
-        else if (value == "standard")
-        {
-            attr.value.s32 = SAI_TUNNEL_DECAP_ECN_MODE_STANDARD;
-        }
-    }
-
-    if (field == "encap_ecn_mode")
-    {
-        // encap ecn mode (only standard is supported)
-        attr.id = SAI_TUNNEL_ATTR_ENCAP_ECN_MODE;
-        if (value == "standard")
-        {
-            attr.value.s32 = SAI_TUNNEL_ENCAP_ECN_MODE_STANDARD;
-        }
-    }
-
     if (field == "ttl_mode")
     {
         // ttl mode (uniform/pipe)
@@ -638,8 +649,8 @@ bool TunnelDecapOrch::setTunnelAttribute(string field, sai_object_id_t value, sa
     {
         // TC remapping.
         attr.id = SAI_TUNNEL_ATTR_DECAP_QOS_DSCP_TO_TC_MAP;
-        attr.value.oid = value; 
-        
+        attr.value.oid = value;
+
     }
     else if (field == decap_tc_to_pg_field_name)
     {
@@ -717,12 +728,13 @@ bool TunnelDecapOrch::setIpAttribute(string key, IpAddresses new_ip_addresses, s
  *    @brief remove decap tunnel
  *
  * Arguments:
+ *    @param[in] table_name - name of the table in APP_DB
  *    @param[in] key - key of the tunnel from APP_DB
  *
  * Return Values:
  *    @return true on success and false if there's an error
  */
-bool TunnelDecapOrch::removeDecapTunnel(string key)
+bool TunnelDecapOrch::removeDecapTunnel(string table_name, string key)
 {
     sai_status_t status;
     TunnelEntry *tunnel_info = &tunnelTable.find(key)->second;
@@ -731,7 +743,16 @@ bool TunnelDecapOrch::removeDecapTunnel(string key)
     for (auto it = tunnel_info->tunnel_term_info.begin(); it != tunnel_info->tunnel_term_info.end(); ++it)
     {
         TunnelTermEntry tunnel_entry_info = *it;
-        string term_key = tunnel_entry_info.src_ip + '-' + tunnel_entry_info.dst_ip;
+        string term_key;
+        swss::IpAddress src_ip(tunnel_entry_info.src_ip);
+        if (!src_ip.isZero())
+        {
+            term_key = src_ip.to_string() + '-' + tunnel_entry_info.dst_ip;
+        }
+        else
+        {
+            term_key = tunnel_entry_info.dst_ip;
+        }
         if (!removeDecapTunnelTermEntry(tunnel_entry_info.tunnel_term_id, term_key))
         {
             return false;
@@ -764,6 +785,7 @@ bool TunnelDecapOrch::removeDecapTunnel(string key)
     }
 
     tunnelTable.erase(key);
+    gQosOrch->removeTunnelReference(table_name, key);
     return true;
 }
 

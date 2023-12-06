@@ -9,6 +9,7 @@
 #include "notificationproducer.h"
 #include "macaddress.h"
 #include "return_code.h"
+#include "saihelper.h"
 
 using namespace std;
 using namespace swss;
@@ -16,6 +17,7 @@ using namespace swss;
 extern sai_object_id_t gSwitchId;
 extern sai_switch_api_t *sai_switch_api;
 extern sai_acl_api_t *sai_acl_api;
+extern sai_hash_api_t *sai_hash_api;
 extern MacAddress gVxlanMacAddress;
 extern CrmOrch *gCrmOrch;
 
@@ -48,6 +50,27 @@ const map<string, sai_packet_action_t> packet_action_map =
 
 const std::set<std::string> switch_non_sai_attribute_set = {"ordered_ecmp"};
 
+void SwitchOrch::set_switch_pfc_dlr_init_capability()
+{
+    vector<FieldValueTuple> fvVector;
+
+    /* Query PFC DLR INIT capability */
+    bool rv = querySwitchCapability(SAI_OBJECT_TYPE_QUEUE, SAI_QUEUE_ATTR_PFC_DLR_INIT);
+    if (rv == false)
+    {
+        SWSS_LOG_INFO("Queue level PFC DLR INIT configuration is not supported");
+        m_PfcDlrInitEnable = false;
+        fvVector.emplace_back(SWITCH_CAPABILITY_TABLE_PFC_DLR_INIT_CAPABLE, "false");
+    }
+    else 
+    {
+        SWSS_LOG_INFO("Queue level PFC DLR INIT configuration is supported");
+        m_PfcDlrInitEnable = true;
+        fvVector.emplace_back(SWITCH_CAPABILITY_TABLE_PFC_DLR_INIT_CAPABLE, "true");
+    }
+    set_switch_capability(fvVector);
+}
+
 SwitchOrch::SwitchOrch(DBConnector *db, vector<TableConnector>& connectors, TableConnector switchTable):
         Orch(connectors),
         m_switchTable(switchTable.first, switchTable.second),
@@ -60,8 +83,12 @@ SwitchOrch::SwitchOrch(DBConnector *db, vector<TableConnector>& connectors, Tabl
     auto restartCheckNotifier = new Notifier(m_restartCheckNotificationConsumer, this, "RESTARTCHECK");
     Orch::addExecutor(restartCheckNotifier);
 
+    set_switch_pfc_dlr_init_capability();
     initSensorsTable();
     querySwitchTpidCapability();
+    querySwitchPortEgressSampleCapability();
+    querySwitchHashDefaults();
+
     auto executorT = new ExecutableTimer(m_sensorsPollerTimer, this, "ASIC_SENSORS_POLL_TIMER");
     Orch::addExecutor(executorT);
 }
@@ -71,16 +98,14 @@ void SwitchOrch::initAclGroupsBindToSwitch()
     // Create an ACL group per stage, INGRESS, EGRESS and PRE_INGRESS
     for (auto stage_it : aclStageLookup)
     {
-        sai_object_id_t group_oid;
-        auto status = createAclGroup(fvValue(stage_it), &group_oid);
+        auto status = createAclGroup(fvValue(stage_it), &m_aclGroups[fvValue(stage_it)]);
         if (!status.ok())
         {
             status.prepend("Failed to create ACL group for stage " + fvField(stage_it) + ": ");
             SWSS_LOG_THROW("%s", status.message().c_str());
         }
         SWSS_LOG_NOTICE("Created ACL group for stage %s", fvField(stage_it).c_str());
-        m_aclGroups[fvValue(stage_it)] = group_oid;
-        status = bindAclGroupToSwitch(fvValue(stage_it), group_oid);
+        status = bindAclGroupToSwitch(fvValue(stage_it), m_aclGroups[fvValue(stage_it)]);
         if (!status.ok())
         {
             status.prepend("Failed to bind ACL group to stage " + fvField(stage_it) + ": ");
@@ -89,12 +114,12 @@ void SwitchOrch::initAclGroupsBindToSwitch()
     }
 }
 
-const std::map<sai_acl_stage_t, sai_object_id_t> &SwitchOrch::getAclGroupOidsBindingToSwitch()
+std::map<sai_acl_stage_t, referenced_object> &SwitchOrch::getAclGroupsBindingToSwitch()
 {
     return m_aclGroups;
 }
 
-ReturnCode SwitchOrch::createAclGroup(const sai_acl_stage_t &group_stage, sai_object_id_t *acl_grp_oid)
+ReturnCode SwitchOrch::createAclGroup(const sai_acl_stage_t &group_stage, referenced_object *acl_grp)
 {
     SWSS_LOG_ENTER();
 
@@ -115,8 +140,9 @@ ReturnCode SwitchOrch::createAclGroup(const sai_acl_stage_t &group_stage, sai_ob
     acl_grp_attr.value.s32list.list = bpoint_list.data();
     acl_grp_attrs.push_back(acl_grp_attr);
 
-    CHECK_ERROR_AND_LOG_AND_RETURN(sai_acl_api->create_acl_table_group(
-                                       acl_grp_oid, gSwitchId, (uint32_t)acl_grp_attrs.size(), acl_grp_attrs.data()),
+    CHECK_ERROR_AND_LOG_AND_RETURN(sai_acl_api->create_acl_table_group(&acl_grp->m_saiObjectId, gSwitchId,
+                                                                       (uint32_t)acl_grp_attrs.size(),
+                                                                       acl_grp_attrs.data()),
                                    "Failed to create ACL group for stage " << group_stage);
     if (group_stage == SAI_ACL_STAGE_INGRESS || group_stage == SAI_ACL_STAGE_PRE_INGRESS ||
         group_stage == SAI_ACL_STAGE_EGRESS)
@@ -124,12 +150,12 @@ ReturnCode SwitchOrch::createAclGroup(const sai_acl_stage_t &group_stage, sai_ob
         gCrmOrch->incCrmAclUsedCounter(CrmResourceType::CRM_ACL_GROUP, (sai_acl_stage_t)group_stage,
                                        SAI_ACL_BIND_POINT_TYPE_SWITCH);
     }
-    SWSS_LOG_INFO("Suceeded to create ACL group %s in stage %d ", sai_serialize_object_id(*acl_grp_oid).c_str(),
-                  group_stage);
+    SWSS_LOG_INFO("Suceeded to create ACL group %s in stage %d ",
+                  sai_serialize_object_id(acl_grp->m_saiObjectId).c_str(), group_stage);
     return ReturnCode();
 }
 
-ReturnCode SwitchOrch::bindAclGroupToSwitch(const sai_acl_stage_t &group_stage, const sai_object_id_t &acl_grp_oid)
+ReturnCode SwitchOrch::bindAclGroupToSwitch(const sai_acl_stage_t &group_stage, const referenced_object &acl_grp)
 {
     SWSS_LOG_ENTER();
 
@@ -137,17 +163,17 @@ ReturnCode SwitchOrch::bindAclGroupToSwitch(const sai_acl_stage_t &group_stage, 
     if (switch_attr_it == aclStageToSwitchAttrLookup.end())
     {
         LOG_ERROR_AND_RETURN(ReturnCode(StatusCode::SWSS_RC_INVALID_PARAM)
-                             << "Failed to set ACL group(" << acl_grp_oid << ") to the SWITCH bind point at stage "
-                             << group_stage);
+                             << "Failed to set ACL group(" << acl_grp.m_saiObjectId
+                             << ") to the SWITCH bind point at stage " << group_stage);
     }
     sai_attribute_t attr;
     attr.id = switch_attr_it->second;
-    attr.value.oid = acl_grp_oid;
+    attr.value.oid = acl_grp.m_saiObjectId;
     auto sai_status = sai_switch_api->set_switch_attribute(gSwitchId, &attr);
     if (sai_status != SAI_STATUS_SUCCESS)
     {
         LOG_ERROR_AND_RETURN(ReturnCode(sai_status) << "[SAI] Failed to set_switch_attribute with attribute.id="
-                                                    << attr.id << " and acl group oid=" << acl_grp_oid);
+                                                    << attr.id << " and acl group oid=" << acl_grp.m_saiObjectId);
     }
     return ReturnCode();
 }
@@ -450,24 +476,278 @@ void SwitchOrch::doAppSwitchTableTask(Consumer &consumer)
     }
 }
 
-void SwitchOrch::doTask(Consumer &consumer)
+bool SwitchOrch::setSwitchHashFieldListSai(const SwitchHash &hash, bool isEcmpHash) const
+{
+    const auto &oid = isEcmpHash ? m_switchHashDefaults.ecmpHash.oid : m_switchHashDefaults.lagHash.oid;
+    const auto &hfSet = isEcmpHash ? hash.ecmp_hash.value : hash.lag_hash.value;
+
+    std::vector<sai_int32_t> hfList;
+    std::transform(
+        hfSet.cbegin(), hfSet.cend(), std::back_inserter(hfList),
+        [](sai_native_hash_field_t value) { return static_cast<sai_int32_t>(value); }
+    );
+
+    sai_attribute_t attr;
+
+    attr.id = SAI_HASH_ATTR_NATIVE_HASH_FIELD_LIST;
+    attr.value.s32list.list = hfList.data();
+    attr.value.s32list.count = static_cast<sai_uint32_t>(hfList.size());
+
+    auto status = sai_hash_api->set_hash_attribute(oid, &attr);
+    return status == SAI_STATUS_SUCCESS;
+}
+
+bool SwitchOrch::setSwitchHashAlgorithmSai(const SwitchHash &hash, bool isEcmpHash) const
+{
+    sai_attribute_t attr;
+
+    attr.id = isEcmpHash ? SAI_SWITCH_ATTR_ECMP_DEFAULT_HASH_ALGORITHM : SAI_SWITCH_ATTR_LAG_DEFAULT_HASH_ALGORITHM;
+    attr.value.s32 = static_cast<sai_int32_t>(isEcmpHash ? hash.ecmp_hash_algorithm.value : hash.lag_hash_algorithm.value);
+
+    auto status = sai_switch_api->set_switch_attribute(gSwitchId, &attr);
+    return status == SAI_STATUS_SUCCESS;
+}
+
+bool SwitchOrch::setSwitchHash(const SwitchHash &hash)
 {
     SWSS_LOG_ENTER();
-    const string & table_name = consumer.getTableName();
 
-    if (table_name == APP_SWITCH_TABLE_NAME)
+    auto hObj = swHlpr.getSwHash();
+    auto cfgUpd = false;
+
+    if (hash.ecmp_hash.is_set)
     {
-        doAppSwitchTableTask(consumer);
-    }
-    else if (table_name == CFG_ASIC_SENSORS_TABLE_NAME)
-    {
-        doCfgSensorsTableTask(consumer);
+        if (hObj.ecmp_hash.value != hash.ecmp_hash.value)
+        {
+            if (swCap.isSwitchEcmpHashSupported())
+            {
+                if (!swCap.validateSwitchHashFieldCap(hash.ecmp_hash.value))
+                {
+                    SWSS_LOG_ERROR("Failed to validate switch ECMP hash: capability is not supported");
+                    return false;
+                }
+
+                if (!setSwitchHashFieldListSai(hash, true))
+                {
+                    SWSS_LOG_ERROR("Failed to set switch ECMP hash in SAI");
+                    return false;
+                }
+
+                cfgUpd = true;
+            }
+            else
+            {
+                SWSS_LOG_WARN("Switch ECMP hash configuration is not supported: skipping ...");
+            }
+        }
     }
     else
     {
-        SWSS_LOG_ERROR("Unknown table : %s", table_name.c_str());
+        if (hObj.ecmp_hash.is_set)
+        {
+            SWSS_LOG_ERROR("Failed to remove switch ECMP hash configuration: operation is not supported");
+            return false;
+        }
     }
 
+    if (hash.lag_hash.is_set)
+    {
+        if (hObj.lag_hash.value != hash.lag_hash.value)
+        {
+            if (swCap.isSwitchLagHashSupported())
+            {
+                if (!swCap.validateSwitchHashFieldCap(hash.lag_hash.value))
+                {
+                    SWSS_LOG_ERROR("Failed to validate switch LAG hash: capability is not supported");
+                    return false;
+                }
+
+                if (!setSwitchHashFieldListSai(hash, false))
+                {
+                    SWSS_LOG_ERROR("Failed to set switch LAG hash in SAI");
+                    return false;
+                }
+
+                cfgUpd = true;
+            }
+            else
+            {
+                SWSS_LOG_WARN("Switch LAG hash configuration is not supported: skipping ...");
+            }
+        }
+    }
+    else
+    {
+        if (hObj.lag_hash.is_set)
+        {
+            SWSS_LOG_ERROR("Failed to remove switch LAG hash configuration: operation is not supported");
+            return false;
+        }
+    }
+
+    if (hash.ecmp_hash_algorithm.is_set)
+    {
+        if (!hObj.ecmp_hash_algorithm.is_set || (hObj.ecmp_hash_algorithm.value != hash.ecmp_hash_algorithm.value))
+        {
+            if (swCap.isSwitchEcmpHashAlgorithmSupported())
+            {
+                if (!swCap.validateSwitchEcmpHashAlgorithmCap(hash.ecmp_hash_algorithm.value))
+                {
+                    SWSS_LOG_ERROR("Failed to validate switch ECMP hash algorithm: capability is not supported");
+                    return false;
+                }
+
+                if (!setSwitchHashAlgorithmSai(hash, true))
+                {
+                    SWSS_LOG_ERROR("Failed to set switch ECMP hash algorithm in SAI");
+                    return false;
+                }
+
+                cfgUpd = true;
+            }
+            else
+            {
+                SWSS_LOG_WARN("Switch ECMP hash algorithm configuration is not supported: skipping ...");
+            }
+        }
+    }
+    else
+    {
+        if (hObj.ecmp_hash_algorithm.is_set)
+        {
+            SWSS_LOG_ERROR("Failed to remove switch ECMP hash algorithm configuration: operation is not supported");
+            return false;
+        }
+    }
+
+    if (hash.lag_hash_algorithm.is_set)
+    {
+        if (!hObj.lag_hash_algorithm.is_set || (hObj.lag_hash_algorithm.value != hash.lag_hash_algorithm.value))
+        {
+            if (swCap.isSwitchLagHashAlgorithmSupported())
+            {
+                if (!swCap.validateSwitchLagHashAlgorithmCap(hash.lag_hash_algorithm.value))
+                {
+                    SWSS_LOG_ERROR("Failed to validate switch LAG hash algorithm: capability is not supported");
+                    return false;
+                }
+
+                if (!setSwitchHashAlgorithmSai(hash, false))
+                {
+                    SWSS_LOG_ERROR("Failed to set switch LAG hash algorithm in SAI");
+                    return false;
+                }
+
+                cfgUpd = true;
+            }
+            else
+            {
+                SWSS_LOG_WARN("Switch LAG hash algorithm configuration is not supported: skipping ...");
+            }
+        }
+    }
+    else
+    {
+        if (hObj.lag_hash_algorithm.is_set)
+        {
+            SWSS_LOG_ERROR("Failed to remove switch LAG hash algorithm configuration: operation is not supported");
+            return false;
+        }
+    }
+
+    // Don't update internal cache when config remains unchanged
+    if (!cfgUpd)
+    {
+        SWSS_LOG_NOTICE("Switch hash in SAI is up-to-date");
+        return true;
+    }
+
+    swHlpr.setSwHash(hash);
+
+    SWSS_LOG_NOTICE("Set switch hash in SAI");
+
+    return true;
+}
+
+void SwitchOrch::doCfgSwitchHashTableTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    auto &map = consumer.m_toSync;
+    auto it = map.begin();
+
+    while (it != map.end())
+    {
+        auto keyOpFieldsValues = it->second;
+        auto key = kfvKey(keyOpFieldsValues);
+        auto op = kfvOp(keyOpFieldsValues);
+
+        SWSS_LOG_INFO("KEY: %s, OP: %s", key.c_str(), op.c_str());
+
+        if (key.empty())
+        {
+            SWSS_LOG_ERROR("Failed to parse switch hash key: empty string");
+            it = map.erase(it);
+            continue;
+        }
+
+        SwitchHash hash;
+
+        if (op == SET_COMMAND)
+        {
+            for (const auto &cit : kfvFieldsValues(keyOpFieldsValues))
+            {
+                auto fieldName = fvField(cit);
+                auto fieldValue = fvValue(cit);
+
+                SWSS_LOG_INFO("FIELD: %s, VALUE: %s", fieldName.c_str(), fieldValue.c_str());
+
+                hash.fieldValueMap[fieldName] = fieldValue;
+            }
+
+            if (swHlpr.parseSwHash(hash))
+            {
+                if (!setSwitchHash(hash))
+                {
+                    SWSS_LOG_ERROR("Failed to set switch hash: ASIC and CONFIG DB are diverged");
+                }
+            }
+        }
+        else if (op == DEL_COMMAND)
+        {
+            SWSS_LOG_ERROR("Failed to remove switch hash: operation is not supported: ASIC and CONFIG DB are diverged");
+        }
+        else
+        {
+            SWSS_LOG_ERROR("Unknown operation(%s)", op.c_str());
+        }
+
+        it = map.erase(it);
+    }
+}
+
+void SwitchOrch::doTask(Consumer &consumer)
+{
+    SWSS_LOG_ENTER();
+
+    const auto &tableName = consumer.getTableName();
+
+    if (tableName == APP_SWITCH_TABLE_NAME)
+    {
+        doAppSwitchTableTask(consumer);
+    }
+    else if (tableName == CFG_ASIC_SENSORS_TABLE_NAME)
+    {
+        doCfgSensorsTableTask(consumer);
+    }
+    else if (tableName == CFG_SWITCH_HASH_TABLE_NAME)
+    {
+        doCfgSwitchHashTableTask(consumer);
+    }
+    else
+    {
+        SWSS_LOG_ERROR("Unknown table : %s", tableName.c_str());
+    }
 }
 
 void SwitchOrch::doTask(NotificationConsumer& consumer)
@@ -709,6 +989,35 @@ void SwitchOrch::set_switch_capability(const std::vector<FieldValueTuple>& value
      m_switchTable.set("switch", values);
 }
 
+void SwitchOrch::querySwitchPortEgressSampleCapability()
+{
+    vector<FieldValueTuple> fvVector;
+    sai_status_t status = SAI_STATUS_SUCCESS;
+    sai_attr_capability_t capability;
+
+    // Check if SAI is capable of handling Port egress sample.
+    status = sai_query_attribute_capability(gSwitchId, SAI_OBJECT_TYPE_PORT,
+                            SAI_PORT_ATTR_EGRESS_SAMPLEPACKET_ENABLE, &capability);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_WARN("Could not query port egress Sample capability %d", status);
+        fvVector.emplace_back(SWITCH_CAPABILITY_TABLE_PORT_EGRESS_SAMPLE_CAPABLE, "false");
+    }
+    else
+    {
+        if (capability.set_implemented)
+        {
+            fvVector.emplace_back(SWITCH_CAPABILITY_TABLE_PORT_EGRESS_SAMPLE_CAPABLE, "true");
+        }
+        else
+        {
+            fvVector.emplace_back(SWITCH_CAPABILITY_TABLE_PORT_EGRESS_SAMPLE_CAPABLE, "false");
+        }
+        SWSS_LOG_NOTICE("port egress Sample capability %d", capability.set_implemented);
+    }
+    set_switch_capability(fvVector);
+}
+
 void SwitchOrch::querySwitchTpidCapability()
 {
     SWSS_LOG_ENTER();
@@ -762,7 +1071,39 @@ void SwitchOrch::querySwitchTpidCapability()
     }
 }
 
-bool SwitchOrch::querySwitchDscpToTcCapability(sai_object_type_t sai_object, sai_attr_id_t attr_id)
+bool SwitchOrch::getSwitchHashOidSai(sai_object_id_t &oid, bool isEcmpHash) const
+{
+    sai_attribute_t attr;
+    attr.id = isEcmpHash ? SAI_SWITCH_ATTR_ECMP_HASH : SAI_SWITCH_ATTR_LAG_HASH;
+    attr.value.oid = SAI_NULL_OBJECT_ID;
+
+    auto status = sai_switch_api->get_switch_attribute(gSwitchId, 1, &attr);
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        return false;
+    }
+
+    oid = attr.value.oid;
+
+    return true;
+}
+
+void SwitchOrch::querySwitchHashDefaults()
+{
+    SWSS_LOG_ENTER();
+
+    if (!getSwitchHashOidSai(m_switchHashDefaults.ecmpHash.oid, true))
+    {
+        SWSS_LOG_WARN("Failed to get switch ECMP hash OID");
+    }
+
+    if (!getSwitchHashOidSai(m_switchHashDefaults.lagHash.oid, false))
+    {
+        SWSS_LOG_WARN("Failed to get switch LAG hash OID");
+    }
+}
+
+bool SwitchOrch::querySwitchCapability(sai_object_type_t sai_object, sai_attr_id_t attr_id)
 {
     SWSS_LOG_ENTER();
 

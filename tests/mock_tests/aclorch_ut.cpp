@@ -19,6 +19,7 @@ extern VRFOrch *gVrfOrch;
 
 extern sai_acl_api_t *sai_acl_api;
 extern sai_switch_api_t *sai_switch_api;
+extern sai_hash_api_t *sai_hash_api;
 extern sai_port_api_t *sai_port_api;
 extern sai_vlan_api_t *sai_vlan_api;
 extern sai_bridge_api_t *sai_bridge_api;
@@ -312,6 +313,7 @@ namespace aclorch_test
             ASSERT_EQ(status, SAI_STATUS_SUCCESS);
 
             sai_api_query(SAI_API_SWITCH, (void **)&sai_switch_api);
+            sai_api_query(SAI_API_HASH, (void **)&sai_hash_api);
             sai_api_query(SAI_API_BRIDGE, (void **)&sai_bridge_api);
             sai_api_query(SAI_API_PORT, (void **)&sai_port_api);
             sai_api_query(SAI_API_VLAN, (void **)&sai_vlan_api);
@@ -426,7 +428,12 @@ namespace aclorch_test
             };
             gRouteOrch = new RouteOrch(m_app_db.get(), route_tables, gSwitchOrch, gNeighOrch, gIntfsOrch, gVrfOrch, gFgNhgOrch, gSrv6Orch);
 
-            PolicerOrch *policer_orch = new PolicerOrch(m_config_db.get(), "POLICER");
+            vector<TableConnector> policer_tables = {
+                TableConnector(m_config_db.get(), CFG_POLICER_TABLE_NAME),
+                TableConnector(m_config_db.get(), CFG_PORT_STORM_CONTROL_TABLE_NAME)
+            };
+            TableConnector stateDbStorm(m_state_db.get(), "BUM_STORM_CAPABILITY");
+            PolicerOrch *policer_orch = new PolicerOrch(policer_tables, gPortsOrch);
 
             TableConnector stateDbMirrorSession(m_state_db.get(), STATE_MIRROR_SESSION_TABLE_NAME);
             TableConnector confDbMirrorSession(m_config_db.get(), CFG_MIRROR_SESSION_TABLE_NAME);
@@ -452,6 +459,8 @@ namespace aclorch_test
             gMirrorOrch = nullptr;
             delete gRouteOrch;
             gRouteOrch = nullptr;
+            delete gSrv6Orch;
+            gSrv6Orch = nullptr;
             delete gNeighOrch;
             gNeighOrch = nullptr;
             delete gFdbOrch;
@@ -466,8 +475,6 @@ namespace aclorch_test
             gPortsOrch = nullptr;
             delete gFgNhgOrch;
             gFgNhgOrch = nullptr;
-            delete gSrv6Orch;
-            gSrv6Orch = nullptr;
 
             auto status = sai_switch_api->remove_switch(gSwitchId);
             ASSERT_EQ(status, SAI_STATUS_SUCCESS);
@@ -582,8 +589,7 @@ namespace aclorch_test
                         return false;
                     }
 
-                    sai_attribute_t new_attr;
-                    memset(&new_attr, 0, sizeof(new_attr));
+                    sai_attribute_t new_attr = {};
 
                     new_attr.id = attr.id;
 
@@ -643,8 +649,7 @@ namespace aclorch_test
                         return false;
                     }
 
-                    sai_attribute_t new_attr;
-                    memset(&new_attr, 0, sizeof(new_attr));
+                    sai_attribute_t new_attr = {};
 
                     new_attr.id = attr.id;
 
@@ -1406,7 +1411,7 @@ namespace aclorch_test
                         {
                             {
                                 ACL_TABLE_TYPE_MATCHES,
-                                string(MATCH_SRC_IP) +  comma + MATCH_ETHER_TYPE + comma + MATCH_L4_SRC_PORT_RANGE
+                                string(MATCH_SRC_IP) +  comma + MATCH_ETHER_TYPE + comma + MATCH_L4_SRC_PORT_RANGE + comma + MATCH_BTH_OPCODE + comma + MATCH_AETH_SYNDROME
                             },
                             {
                                 ACL_TABLE_TYPE_BPOINT_TYPES,
@@ -1428,6 +1433,8 @@ namespace aclorch_test
             { "SAI_ACL_TABLE_ATTR_FIELD_SRC_IP", "true" },
             { "SAI_ACL_TABLE_ATTR_FIELD_ETHER_TYPE", "true" },
             { "SAI_ACL_TABLE_ATTR_FIELD_ACL_RANGE_TYPE", "1:SAI_ACL_RANGE_TYPE_L4_SRC_PORT_RANGE" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_BTH_OPCODE", "true" },
+            { "SAI_ACL_TABLE_ATTR_FIELD_AETH_SYNDROME", "true" },
         };
 
         ASSERT_TRUE(validateAclTable(
@@ -1481,8 +1488,46 @@ namespace aclorch_test
                         aclTableName + "|" + aclRuleName,
                         SET_COMMAND,
                         {
+                            { ACTION_PACKET_ACTION, PACKET_ACTION_DROP },
+                            { MATCH_BTH_OPCODE, "0x60" },
+                        }
+                    }
+                }
+            )
+        );
+
+        // MATCH_BTH_OPCODE invalid format
+        ASSERT_FALSE(orch->getAclRule(aclTableName, aclRuleName));
+
+        orch->doAclRuleTask(
+            deque<KeyOpFieldsValuesTuple>(
+                {
+                    {
+                        aclTableName + "|" + aclRuleName,
+                        SET_COMMAND,
+                        {
+                            { ACTION_PACKET_ACTION, PACKET_ACTION_DROP },
+                            { MATCH_AETH_SYNDROME, "0x60" },
+                        }
+                    }
+                }
+            )
+        );
+
+        // MATCH_AETH_SYNDROME invalid format
+        ASSERT_FALSE(orch->getAclRule(aclTableName, aclRuleName));
+
+        orch->doAclRuleTask(
+            deque<KeyOpFieldsValuesTuple>(
+                {
+                    {
+                        aclTableName + "|" + aclRuleName,
+                        SET_COMMAND,
+                        {
                             { MATCH_SRC_IP, "1.1.1.1/32" },
                             { ACTION_PACKET_ACTION, PACKET_ACTION_DROP },
+                            { MATCH_BTH_OPCODE, "0x60/0xff" },
+                            { MATCH_AETH_SYNDROME, "0x60/0x60" },
                         }
                     }
                 }
@@ -1749,5 +1794,97 @@ namespace aclorch_test
 
         // try to delete non existing acl rule
         ASSERT_TRUE(orch->m_aclOrch->removeAclRule(tableId, ruleId));
+    }
+
+    sai_switch_api_t *old_sai_switch_api;
+
+    // The following function is used to override SAI API get_switch_attribute to request passing
+    // mandatory ACL actions to SAI when creating mirror ACL table.
+    sai_status_t getSwitchAttribute(_In_ sai_object_id_t switch_id,_In_ uint32_t attr_count,
+                                    _Inout_ sai_attribute_t *attr_list)
+    {
+        if (attr_count == 1)
+        {
+            switch(attr_list[0].id)
+            {
+            case SAI_SWITCH_ATTR_MAX_ACL_ACTION_COUNT:
+                attr_list[0].value.u32 = 2;
+                return SAI_STATUS_SUCCESS;
+            case SAI_SWITCH_ATTR_ACL_STAGE_INGRESS:
+            case SAI_SWITCH_ATTR_ACL_STAGE_EGRESS:
+                attr_list[0].value.aclcapability.action_list.count = 2;
+                attr_list[0].value.aclcapability.action_list.list[0]= SAI_ACL_ACTION_TYPE_COUNTER;
+                attr_list[0].value.aclcapability.action_list.list[1]=
+                    attr_list[0].id == SAI_SWITCH_ATTR_ACL_STAGE_INGRESS ?
+                        SAI_ACL_ACTION_TYPE_MIRROR_INGRESS : SAI_ACL_ACTION_TYPE_MIRROR_EGRESS;
+                attr_list[0].value.aclcapability.is_action_list_mandatory = true;
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+        return old_sai_switch_api->get_switch_attribute(switch_id, attr_count, attr_list);
+    }
+
+    TEST_F(AclOrchTest, AclTableCreationWithMandatoryActions)
+    {
+        // Override SAI API get_switch_attribute to request passing mandatory ACL actions to SAI
+        // when creating mirror ACL table.
+        old_sai_switch_api = sai_switch_api;
+        sai_switch_api_t new_sai_switch_api = *sai_switch_api;
+        sai_switch_api = &new_sai_switch_api;
+        sai_switch_api->get_switch_attribute = getSwitchAttribute;
+
+        // Set platform env to enable support of MIRRORV6 ACL table.
+        bool unset_platform_env = false;
+        if (!getenv("platform"))
+        {
+            setenv("platform", VS_PLATFORM_SUBSTRING, 0);
+            unset_platform_env = true;
+        }
+
+        auto orch = createAclOrch();
+
+        for (const auto &acl_table_type : { TABLE_TYPE_MIRROR, TABLE_TYPE_MIRRORV6, TABLE_TYPE_MIRROR_DSCP })
+        {
+            for (const auto &acl_table_stage : { STAGE_INGRESS, STAGE_EGRESS })
+            {
+                // Create ACL table.
+                string acl_table_id = "mirror_acl_table";
+                auto kvfAclTable = deque<KeyOpFieldsValuesTuple>(
+                    { { acl_table_id,
+                        SET_COMMAND,
+                        { { ACL_TABLE_DESCRIPTION, acl_table_type },
+                          { ACL_TABLE_TYPE, acl_table_type },
+                          { ACL_TABLE_STAGE, acl_table_stage },
+                          { ACL_TABLE_PORTS, "1,2" } } } });
+                orch->doAclTableTask(kvfAclTable);
+                auto acl_table = orch->getAclTable(acl_table_id);
+                ASSERT_NE(acl_table, nullptr);
+
+                // Verify mandaotry ACL actions has been added.
+                auto acl_actions = acl_table->type.getActions();
+                ASSERT_NE(acl_actions.find(SAI_ACL_ACTION_TYPE_COUNTER), acl_actions.end());
+                sai_acl_action_type_t action = strcmp(acl_table_stage, STAGE_INGRESS) == 0 ?
+                    SAI_ACL_ACTION_TYPE_MIRROR_INGRESS : SAI_ACL_ACTION_TYPE_MIRROR_EGRESS;
+                ASSERT_NE(acl_actions.find(action), acl_actions.end());
+
+                // Delete ACL table.
+                kvfAclTable = deque<KeyOpFieldsValuesTuple>(
+                    { { acl_table_id,
+                        DEL_COMMAND,
+                        {} } });
+                orch->doAclTableTask(kvfAclTable);
+                acl_table = orch->getAclTable(acl_table_id);
+                ASSERT_EQ(acl_table, nullptr);
+            }
+        }
+
+        // Unset platform env.
+        if (unset_platform_env)
+        {
+            unsetenv("platform");
+        }
+
+        // Restore sai_switch_api.
+        sai_switch_api = old_sai_switch_api;
     }
 } // namespace nsAclOrchTest
